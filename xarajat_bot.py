@@ -1,358 +1,646 @@
+"""
+Xarajatlarim boti (v2, bardoshli versiya)
+
+Asosiy yaxshilanishlar:
+  * Gemini modelini o'zi topadi (nom eskirsa ham bot yiqilmaydi)
+  * 503/429/404 bo'lsa: boshqa modelga o'tadi, qayta urinadi
+  * AI butunlay band bo'lsa: xabarni xotirada ushlab, orqa fonda qayta urinadi
+    va natijani o'zi yuboradi (foydalanuvchi qayta yubormaydi)
+  * Tokenni logga yozmaydi (httpx logi o'chirilgan)
+  * "5000 kofe" -> 5 000 000 bo'lib ketadigan xato tuzatilgan
+  * 409 Conflict (ikkita nusxa) aniq xabar bilan logga yoziladi
+  * /ai buyrug'i: AI holatini tekshirish
+"""
 import os
 import re
+import sys
 import json
 import html
+import time
+import random
 import asyncio
 import logging
 import threading
 import urllib.request
 import datetime as dt
-from collections import defaultdict
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
-from telegram import (
-    Update, BotCommand, ReplyKeyboardMarkup,
-    InlineKeyboardButton, InlineKeyboardMarkup,
-)
+from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
+    ContextTypes, filters,
 )
 from google import genai
 from google.genai import types
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+# httpx URL ni (ichida bot tokeni bor) logga yozmasligi uchun
+for _n in ("httpx", "httpcore"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("xarajat")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-TZ = ZoneInfo("Asia/Tashkent")
-HTML = ParseMode.HTML
+# ---------------- Sozlamalar ----------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip("\"'")
+if not re.fullmatch(r"\d{6,}:[A-Za-z0-9_-]{30,}", BOT_TOKEN):
+    sys.exit(
+        "BOT_TOKEN noto'g'ri. U 'raqamlar:harflar' ko'rinishida bo'lishi kerak "
+        "(BotFather bergan to'liq token, ':' belgisi bilan)."
+    )
 
-# ---------- Baza (Postgres yoki SQLite) ----------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip("\"'")
+TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Tashkent"))
+PORT = int(os.environ.get("PORT", "10000"))
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+MAX_AMOUNT = 10_000_000_000
+
+# Ixtiyoriy: GEMINI_MODELS="model1,model2" (bo'lmasa, o'zi topadi)
+PREFERRED = [
+    m.strip().removeprefix("models/")
+    for m in os.getenv("GEMINI_MODELS", os.getenv("GEMINI_MODEL", "")).split(",")
+    if m.strip()
+]
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+
+client = (
+    genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=30_000))
+    if GEMINI_API_KEY else None
+)
+
+CATEGORIES = [
+    "Oziq-ovqat", "Transport", "Uy-joy", "Kiyim", "Salomatlik",
+    "Ko'ngil ochar", "Aloqa", "Ta'lim", "Boshqa",
+]
+KEYWORDS = {
+    "Oziq-ovqat": ["non", "go'sht", "gosht", "sut", "ovqat", "osh", "plov", "choy", "kofe",
+                   "bozor", "market", "meva", "sabzavot", "restoran", "kafe", "tushlik",
+                   "nonushta", "kechki", "somsa", "lavash", "burger", "pitsa", "suv", "ichimlik"],
+    "Transport": ["taksi", "benzin", "yoqilg'i", "metro", "avtobus", "yo'l", "mashina", "gaz", "parkovka"],
+    "Uy-joy": ["ijara", "kommunal", "svet", "elektr", "gaz pul", "uy", "remont", "internet"],
+    "Kiyim": ["kiyim", "oyoq kiyim", "krossovka", "ko'ylak", "shim", "kurtka"],
+    "Salomatlik": ["dori", "apteka", "shifokor", "doktor", "klinika", "tish"],
+    "Ko'ngil ochar": ["kino", "o'yin", "konsert", "sayohat", "dam olish"],
+    "Aloqa": ["telefon", "paket", "aloqa", "mobil", "tarif"],
+    "Ta'lim": ["kurs", "kitob", "o'qish", "maktab", "universitet", "dars"],
+}
+
+BTN_TODAY = "📅 Bugun"
+BTN_MONTH = "🗓 Shu oy"
+BTN_ARCHIVE = "🗄 Arxiv"
+BTN_UNDO = "↩️ Oxirgisini o'chirish"
+BTN_HELP = "ℹ️ Yordam"
+KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_TODAY, BTN_MONTH], [BTN_ARCHIVE, BTN_UNDO], [BTN_HELP]],
+    resize_keyboard=True,
+)
+
+HELP_TEXT = (
+    "<b>Xarajatlarim boti</b>\n\n"
+    "Xarajatni oddiy yozing yoki 🎤 ovozli xabar yuboring:\n"
+    "• <code>non 5000</code>\n"
+    "• <code>taksi 15 ming, tushlik 32000</code>\n"
+    "• <code>5000 suv</code>\n\n"
+    "Pastdagi tugmalar:\n"
+    "📅 Bugun, 🗓 Shu oy, 🗄 Arxiv (oldingi oylar), ↩️ Oxirgisini o'chirish.\n\n"
+    "AI band bo'lsa, xabaringiz saqlanadi va natija o'zi yuboriladi."
+)
+
+# ---------------- Baza ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///xarajat.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
-IS_PG = engine.dialect.name == "postgresql"
-
-
-def q(sql: str, **params):
-    with engine.begin() as c:
-        res = c.execute(text(sql), params)
-        return [dict(r._mapping) for r in res] if res.returns_rows else []
 
 
 def init_db():
-    pk = "SERIAL PRIMARY KEY" if IS_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
-    q(f"""CREATE TABLE IF NOT EXISTS expenses(
-        id {pk}, user_id BIGINT, amount BIGINT, note TEXT,
-        category TEXT, day TEXT, created_at TEXT)""")
-    q("CREATE TABLE IF NOT EXISTS users(user_id BIGINT PRIMARY KEY)")
+    if DATABASE_URL.startswith("sqlite") and os.getenv("RENDER"):
+        log.warning("DIQQAT: SQLite Render'da har deployda o'chadi. "
+                    "Doimiy saqlash uchun DATABASE_URL (Postgres) kiriting.")
+    ident = "SERIAL PRIMARY KEY" if "postgresql" in DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with engine.begin() as c:
+        c.execute(text(
+            f"CREATE TABLE IF NOT EXISTS expenses ("
+            f"id {ident}, user_id BIGINT NOT NULL, amount BIGINT NOT NULL, "
+            f"category VARCHAR(50), note VARCHAR(300), created_at TIMESTAMP NOT NULL)"
+        ))
+        c.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_exp_user_time ON expenses (user_id, created_at)"
+        ))
 
 
-def add_user(uid: int):
-    q("INSERT INTO users(user_id) VALUES(:u) ON CONFLICT(user_id) DO NOTHING", u=uid)
+def now_local():
+    return dt.datetime.now(TZ).replace(tzinfo=None, microsecond=0)
 
 
-# ---------- Yordamchi ----------
-CAT = {
-    "ovqat": "🍽", "transport": "🚕", "o'qish": "📚", "kommunal": "💡",
-    "kiyim": "👕", "salomatlik": "💊", "ko'ngilochar": "🎮", "boshqa": "📦",
-}
-MONTHS = ["yanvar", "fevral", "mart", "aprel", "may", "iyun", "iyul",
-          "avgust", "sentabr", "oktabr", "noyabr", "dekabr"]
-
-PROMPT = """Foydalanuvchi o'zbek tilida xarajatlarini yozadi yoki aytadi.
-Barcha xarajatlarni ajratib, FAQAT JSON massiv qaytar:
-[{"amount": so'mda butun son, "note": qisqa izoh (bosh harf bilan), "category": ovqat|transport|o'qish|kommunal|kiyim|salomatlik|ko'ngilochar|boshqa}]
-"15 ming" = 15000, "ikki yarim ming" = 2500, "1 million" = 1000000.
-Xarajat bo'lmasa bo'sh massiv [] qaytar."""
+def add_expenses(user_id, items):
+    ts = now_local()
+    with engine.begin() as c:
+        for it in items:
+            c.execute(text(
+                "INSERT INTO expenses (user_id, amount, category, note, created_at) "
+                "VALUES (:u, :a, :c, :n, :t)"),
+                {"u": user_id, "a": int(it["amount"]), "c": it["category"],
+                 "n": it["note"][:300], "t": ts})
 
 
-def today() -> str:
-    return dt.datetime.now(TZ).date().isoformat()
+def fetch_range(user_id, start, end):
+    with engine.connect() as c:
+        return c.execute(text(
+            "SELECT id, amount, category, note, created_at FROM expenses "
+            "WHERE user_id=:u AND created_at>=:s AND created_at<:e ORDER BY created_at"),
+            {"u": user_id, "s": start, "e": end}).fetchall()
 
 
-def fmt(n) -> str:
+def fetch_all(user_id):
+    with engine.connect() as c:
+        return c.execute(text(
+            "SELECT amount, created_at FROM expenses WHERE user_id=:u"),
+            {"u": user_id}).fetchall()
+
+
+def delete_last(user_id):
+    with engine.begin() as c:
+        row = c.execute(text(
+            "SELECT id, amount, category, note FROM expenses WHERE user_id=:u "
+            "ORDER BY created_at DESC, id DESC LIMIT 1"), {"u": user_id}).fetchone()
+        if not row:
+            return None
+        c.execute(text("DELETE FROM expenses WHERE id=:i"), {"i": row[0]})
+    return row
+
+
+# ---------------- Yordamchi ----------------
+def fmt(n):
     return f"{int(n):,}".replace(",", " ")
 
 
-def bar(pct: int) -> str:
-    f = round(pct / 10)
-    return "▓" * f + "░" * (10 - f)
+def to_dt(v):
+    if isinstance(v, dt.datetime):
+        return v
+    return dt.datetime.fromisoformat(str(v))
 
 
-def month_title(ym: str) -> str:
-    y, m = ym.split("-")
-    return f"{MONTHS[int(m) - 1].capitalize()} {y}"
+def guess_category(note):
+    low = note.lower()
+    for cat, words in KEYWORDS.items():
+        if any(w in low for w in words):
+            return cat
+    return "Boshqa"
 
 
-def E(s) -> str:
-    return html.escape(str(s))
+# birlik so'zdan keyin harf kelsa ("kofe") birlik hisoblanmaydi
+NUM_RE = re.compile(
+    r"(\d{1,3}(?:[ .,]\d{3})+|\d+(?:[.,]\d+)?)(?:\s*(ming|mln|million|k|so'm|som|sum)(?![A-Za-z'’]))?",
+    re.I,
+)
 
 
-# ---------- Ko'rinishlar (matn + tugmalar) ----------
-def day_view(uid: int, day: str):
-    rows = q("SELECT id, amount, note, category FROM expenses "
-             "WHERE user_id=:u AND day=:d ORDER BY id", u=uid, d=day)
-    title = "Bugun" if day == today() else day
-    if not rows:
-        return (f"📅 <b>{title}</b>\n\nHozircha xarajat yo'q.\n"
-                "Yozing yoki 🎤 ovozli xabar yuboring.", None)
-    lines = [f"📅 <b>{title}</b>\n"]
-    for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {CAT.get(r['category'], '📦')} {E(r['note'])} — <b>{fmt(r['amount'])}</b>")
-    total = sum(r["amount"] for r in rows)
-    lines.append(f"\n💰 <b>Jami: {fmt(total)} so'm</b>")
-    lines.append("\n<i>O'chirish uchun raqamni bosing:</i>")
-    btns = [InlineKeyboardButton(f"🗑 {i}", callback_data=f"del:{r['id']}")
-            for i, r in enumerate(rows, 1)]
-    kb = [btns[i:i + 5] for i in range(0, len(btns), 5)]
-    kb.append([InlineKeyboardButton("🗓 Shu oy hisoboti", callback_data="month")])
-    return "\n".join(lines), InlineKeyboardMarkup(kb)
+def _to_number(s):
+    """'5 000' -> 5000, '1.500' -> 1500, '1.5' -> 1.5"""
+    if re.fullmatch(r"\d{1,3}(?:[ .,]\d{3})+", s):
+        return int(re.sub(r"[ .,]", "", s))
+    return float(s.replace(",", "."))
 
 
-def month_view(uid: int, ym: str):
-    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", ym):
-        return archive_view(uid)
-    back = InlineKeyboardMarkup([[InlineKeyboardButton("🗄 Arxivga qaytish", callback_data="arch")]])
-    title = month_title(ym)
-    rows = q("SELECT category, amount, day FROM expenses WHERE user_id=:u AND day LIKE :p",
-             u=uid, p=ym + "%")
-    if not rows:
-        return f"🗓 <b>{title}</b>\n\nBu oyda xarajat yo'q.", back
-    total = sum(r["amount"] for r in rows)
-    by_cat, by_day = defaultdict(int), defaultdict(int)
-    for r in rows:
-        by_cat[r["category"]] += r["amount"]
-        by_day[r["day"]] += r["amount"]
-    lines = [f"🗓 <b>{title}</b>", "", f"💰 <b>Jami: {fmt(total)} so'm</b>", "",
-             "<b>Kategoriyalar:</b>"]
-    for cat, s in sorted(by_cat.items(), key=lambda x: -x[1]):
-        pct = s * 100 // total
-        lines.append(f"{CAT.get(cat, '📦')} {cat.capitalize()} — {fmt(s)}\n{bar(pct)} {pct}%")
-    top_day, top_sum = max(by_day.items(), key=lambda x: x[1])
-    lines += ["",
-              f"📊 O'rtacha kuniga: <b>{fmt(total // len(by_day))}</b> so'm",
-              f"🔥 Eng qimmat kun: {int(top_day[8:])}-sana — {fmt(top_sum)} so'm",
-              f"🧾 Yozuvlar soni: {len(rows)}"]
-    return "\n".join(lines), back
+def parse_local(raw):
+    """AI ishlamasa ham matnni tushunadigan oddiy parser."""
+    items = []
+    for part in re.split(r"(?<!\d),|,(?!\d)|[\n;]+|\s+va\s+|\s+и\s+", raw):
+        part = part.strip()
+        best = None  # (birlik_bormi, summa, match)
+        for m in NUM_RE.finditer(part):
+            num = _to_number(m.group(1))
+            unit = (m.group(2) or "").lower()
+            if unit in ("ming", "k"):
+                num *= 1000
+            elif unit in ("mln", "million"):
+                num *= 1_000_000
+            num = int(round(num))
+            cand = (1 if unit in ("ming", "k", "mln", "million") else 0, num, m)
+            if best is None or cand[:2] > best[:2]:
+                best = cand
+        if not best:
+            continue
+        _, num, m = best
+        note = (part[:m.start()] + " " + part[m.end():]).strip(" -:.")
+        note = re.sub(r"\s+", " ", note) or "Xarajat"
+        if 0 < num <= MAX_AMOUNT:
+            items.append({"amount": num, "category": guess_category(note), "note": note})
+    return items
 
 
-def archive_view(uid: int):
-    rows = q("SELECT substr(day,1,7) AS ym, SUM(amount) AS s FROM expenses "
-             "WHERE user_id=:u GROUP BY substr(day,1,7) ORDER BY ym DESC LIMIT 24", u=uid)
-    if not rows:
-        return "🗄 <b>Arxiv</b>\n\nHozircha bo'sh. Birinchi xarajatingizni yozing!", None
-    kb = [[InlineKeyboardButton(f"🗓 {month_title(r['ym'])} — {fmt(r['s'])}",
-                                callback_data=f"m:{r['ym']}")] for r in rows]
-    return "🗄 <b>Arxiv</b>\n\nOyni tanlang:", InlineKeyboardMarkup(kb)
+def clean_items(data):
+    out = []
+    for it in (data or []):
+        if not isinstance(it, dict):
+            continue
+        try:
+            amount = int(float(str(it.get("amount")).replace(" ", "")))
+        except Exception:
+            continue
+        if amount <= 0 or amount > MAX_AMOUNT:
+            continue
+        cat = it.get("category") if it.get("category") in CATEGORIES else "Boshqa"
+        note = str(it.get("note") or "Xarajat").strip() or "Xarajat"
+        out.append({"amount": amount, "category": cat, "note": note})
+    return out
 
 
-# ---------- AI ----------
-def extract(content):
-    r = client.models.generate_content(
-        model=MODEL, contents=[PROMPT, content],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+# ---------------- AI: model topish + qayta urinish ----------------
+PROMPT = (
+    "Foydalanuvchi o'zbek tilida (ba'zan rus aralash) xarajat haqida yozgan yoki aytgan. "
+    "Barcha xarajatlarni ajrat. Faqat JSON qaytar, boshqa matn yo'q:\n"
+    '{"items":[{"amount":<so\'mda butun son>,"category":"<' + "|".join(CATEGORIES) + '>",'
+    '"note":"<qisqa nom>"}]}\n'
+    "'ming'=1000, 'mln'/'million'=1000000. Xarajat bo'lmasa items bo'sh bo'lsin."
+)
+GEN_CFG = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+
+_BAD_WORDS = ("image", "tts", "live", "audio", "embed", "robotics", "computer",
+              "vision", "aqa", "imagen", "veo", "gemma", "learnlm")
+_cache = {"ts": 0.0, "list": []}
+_dead = {}  # model -> qaysi vaqtgacha o'tkazib yuboriladi
+_lock = threading.Lock()
+AI_SEM = asyncio.Semaphore(4)
+
+
+class AIAuthError(Exception):
+    pass
+
+
+def _version_key(name):
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    ver = float(m.group(1)) if m else 0.0
+    lite = 1 if "lite" in name else 0
+    pre = 1 if ("preview" in name or "exp" in name) else 0
+    return (-ver, lite, pre, name)
+
+
+def _discover():
+    names = set()
+    for m in client.models.list():
+        n = (m.name or "").removeprefix("models/")
+        acts = getattr(m, "supported_actions", None) or []
+        if acts and "generateContent" not in acts:
+            continue
+        if "flash" not in n or any(b in n for b in _BAD_WORDS):
+            continue
+        names.add(n)
+    return sorted(names, key=_version_key)
+
+
+def get_models(force=False):
+    now = time.time()
+    with _lock:
+        if force or not _cache["list"] or now - _cache["ts"] > 6 * 3600:
+            try:
+                _cache["list"] = _discover()
+                _cache["ts"] = now
+                log.info("Topilgan Gemini modellari: %s", _cache["list"][:6])
+            except Exception as e:
+                log.warning("Model ro'yxatini olib bo'lmadi: %s", str(e)[:150])
+                _cache["ts"] = now - 5 * 3600  # 1 soatdan keyin qayta urinadi
+        order = list(dict.fromkeys(PREFERRED + _cache["list"][:4] + FALLBACK_MODELS))
+        alive = [m for m in order if _dead.get(m, 0) < now]
+        return alive or order
+
+
+def _classify(e):
+    s = str(e)
+    code = getattr(e, "code", None)
+    if code == 404 or "NOT_FOUND" in s:
+        return "dead"
+    if (code in (401, 403) or "PERMISSION_DENIED" in s
+            or "API_KEY_INVALID" in s or "API key not valid" in s):
+        return "auth"
+    if code == 400:
+        return "next"
+    return "retry"
+
+
+def _call_ai(contents, rounds=3):
+    if not client:
+        raise RuntimeError("GEMINI_API_KEY kiritilmagan")
+    last = None
+    for rnd in range(rounds):
+        for model in get_models():
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=contents, config=GEN_CFG)
+                if resp.text:
+                    return resp.text
+                last = RuntimeError("AI bo'sh javob berdi")
+            except Exception as e:
+                last = e
+                kind = _classify(e)
+                log.warning("AI %s (urinish %d): %s", model, rnd + 1, str(e)[:160])
+                if kind == "auth":
+                    raise AIAuthError(str(e))
+                if kind == "dead":
+                    _dead[model] = time.time() + 3600
+                    _cache["ts"] = 0  # keyingi safar ro'yxatni yangilaydi
+        if rnd < rounds - 1:
+            time.sleep(min(2 ** (rnd + 1), 8) + random.random())
+    raise last or RuntimeError("AI mavjud emas")
+
+
+def _parse_json(raw):
+    raw = (raw or "").strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    data = json.loads(raw)
+    return data.get("items", []) if isinstance(data, dict) else data
+
+
+async def ai_from_text(raw, rounds=1):
+    """Ro'yxat (bo'sh bo'lishi mumkin) yoki None (AI ishlamadi)."""
+    if not client:
+        return None
     try:
-        data = json.loads(r.text)
-        return data if isinstance(data, list) else []
+        async with AI_SEM:
+            out = await asyncio.to_thread(_call_ai, [PROMPT + "\n\nMatn: " + raw], rounds)
+        return clean_items(_parse_json(out))
+    except Exception as e:
+        log.error("AI matn xatosi: %s", str(e)[:200])
+        return None
+
+
+async def ai_from_voice(data: bytes, mime="audio/ogg", rounds=2):
+    if not client:
+        return None
+    try:
+        part = types.Part.from_bytes(data=data, mime_type=mime)
+        async with AI_SEM:
+            out = await asyncio.to_thread(_call_ai, [PROMPT + "\n\nOvozli xabar:", part], rounds)
+        return clean_items(_parse_json(out))
+    except Exception as e:
+        log.error("AI ovoz xatosi: %s", str(e)[:200])
+        return None
+
+
+# ---------------- Hisobot ----------------
+def build_report(title, rows):
+    if not rows:
+        return f"<b>{title}</b>\n\nHozircha xarajat yo'q. Yozing yoki 🎤 ovozli xabar yuboring."
+    total = sum(r[1] for r in rows)
+    by_cat = {}
+    for r in rows:
+        by_cat[r[2]] = by_cat.get(r[2], 0) + r[1]
+    lines = [f"<b>{title}</b>", ""]
+    for r in rows[-25:]:
+        t = to_dt(r[4]).strftime("%d.%m %H:%M")
+        lines.append(f"{t}  {html.escape(r[3])} — <b>{fmt(r[1])}</b>")
+    if len(rows) > 25:
+        lines.insert(2, f"<i>(oxirgi 25 ta ko'rsatildi, jami {len(rows)} ta)</i>")
+    lines += ["", "<b>Kategoriyalar:</b>"]
+    for cat, s in sorted(by_cat.items(), key=lambda x: -x[1]):
+        lines.append(f"• {html.escape(cat)}: {fmt(s)}")
+    lines += ["", f"<b>Jami: {fmt(total)} so'm</b>"]
+    return "\n".join(lines)
+
+
+async def reply(update: Update, text_, **kw):
+    try:
+        await update.effective_message.reply_text(
+            text_, parse_mode=ParseMode.HTML, reply_markup=KEYBOARD, **kw)
     except Exception:
-        return []
+        try:
+            await update.effective_message.reply_text(
+                re.sub(r"<[^>]+>", "", text_), reply_markup=KEYBOARD)
+        except Exception as e:
+            log.error("Javob yuborilmadi: %s", e)
 
 
-# ---------- Buyruqlar ----------
-MENU = ReplyKeyboardMarkup(
-    [["📅 Bugun", "🗓 Shu oy"], ["🗄 Arxiv", "↩️ Oxirgisini o'chirish"], ["ℹ️ Yordam"]],
-    resize_keyboard=True,
-)
-
-HELP = (
-    "💸 <b>Kunlik xarajatlarim</b>\n\n"
-    "Xarajatingizni oddiy so'z bilan yozing yoki 🎤 ovoz yuboring:\n"
-    "• <i>non 4000</i>\n"
-    "• <i>taksi 15 ming, tushlik 32 ming</i>\n\n"
-    "Bot o'zi summa va kategoriyani aniqlaydi.\n"
-    "Har kuni soat 22:00 da kunlik hisobot, oyning 1-kuni esa o'tgan oyning "
-    "to'liq hisoboti avtomatik keladi.\n\n"
-    "Pastdagi tugmalardan foydalaning 👇"
-)
+async def push(app: Application, chat_id, text_):
+    """Foydalanuvchiga mustaqil xabar (orqa fondagi natijalar uchun)."""
+    try:
+        await app.bot.send_message(chat_id, text_, parse_mode=ParseMode.HTML,
+                                   reply_markup=KEYBOARD)
+    except Exception:
+        try:
+            await app.bot.send_message(chat_id, re.sub(r"<[^>]+>", "", text_),
+                                       reply_markup=KEYBOARD)
+        except Exception as e:
+            log.error("Push yuborilmadi: %s", e)
 
 
-async def reply(update: Update, text_: str, kb=None):
-    await update.effective_message.reply_text(text_, parse_mode=HTML, reply_markup=kb)
+# ---------------- Orqa fonda qayta urinish ----------------
+_bg = set()
+RETRY_DELAYS = [15, 30, 60, 90, 120, 180, 240]  # jami ~12 daqiqa
 
 
+def schedule_retry(app, chat_id, user_id, make_call, prefix=""):
+    """make_call() -> coroutine, ro'yxat yoki None qaytaradi."""
+    if len(_bg) >= 30:
+        return False
+
+    async def runner():
+        try:
+            for d in RETRY_DELAYS:
+                await asyncio.sleep(d)
+                items = await make_call()
+                if items is None:
+                    continue
+                if not items:
+                    await push(app, chat_id, "Xabaringizdan xarajat topilmadi. Aniqroq yozing: «non 5000».")
+                    return
+                try:
+                    await asyncio.to_thread(add_expenses, user_id, items)
+                except Exception as e:
+                    log.error("Bazaga yozishda xato (bg): %s", e)
+                    await push(app, chat_id, "Saqlashda muammo bo'ldi, qayta yuboring.")
+                    return
+                await push(app, chat_id, prefix + confirm_text(items))
+                return
+            await push(app, chat_id,
+                       "😔 AI uzoq vaqt band bo'ldi. Iltimos, matn bilan yozing: <code>non 5000</code>")
+        except Exception as e:
+            log.error("Orqa fon qayta urinish xatosi: %s", e)
+
+    t = asyncio.create_task(runner())
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
+    return True
+
+
+# ---------------- Handlerlar ----------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    add_user(update.effective_user.id)
-    await update.message.reply_text(HELP, parse_mode=HTML, reply_markup=MENU)
+    await reply(update, "Salom! 👋\n\n" + HELP_TEXT)
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await reply(update, HELP, MENU)
+    await reply(update, HELP_TEXT)
 
 
-async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t, kb = day_view(update.effective_user.id, today())
-    await reply(update, t, kb)
-
-
-async def cmd_month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t, kb = month_view(update.effective_user.id, today()[:7])
-    await reply(update, t, kb)
-
-
-async def cmd_archive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t, kb = archive_view(update.effective_user.id)
-    await reply(update, t, kb)
-
-
-async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    r = q("SELECT id, amount, note FROM expenses WHERE user_id=:u ORDER BY id DESC LIMIT 1", u=uid)
-    if not r:
-        await reply(update, "O'chirish uchun yozuv yo'q.")
+async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """AI holatini tekshirish."""
+    if not client:
+        await reply(update, "❌ GEMINI_API_KEY kiritilmagan.")
         return
-    q("DELETE FROM expenses WHERE id=:i AND user_id=:u", i=r[0]["id"], u=uid)
-    await reply(update, f"🗑 O'chirildi: {E(r[0]['note'])} — {fmt(r[0]['amount'])} so'm")
-
-
-ROUTES = {
-    "📅 Bugun": cmd_today, "🗓 Shu oy": cmd_month, "🗄 Arxiv": cmd_archive,
-    "↩️ Oxirgisini o'chirish": cmd_undo, "ℹ️ Yordam": cmd_help,
-}
-
-
-# ---------- Xarajat qabul qilish ----------
-async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    m = update.message
-    uid = update.effective_user.id
-    add_user(uid)
-    if m.text and m.text.strip() in ROUTES:
-        await ROUTES[m.text.strip()](update, ctx)
-        return
-
-    await m.chat.send_action("typing")
+    models = await asyncio.to_thread(get_models)
     try:
-        if m.voice:
-            f = await m.voice.get_file()
-            data = bytes(await f.download_as_bytearray())
-            content = types.Part.from_bytes(data=data, mime_type="audio/ogg")
-        else:
-            content = m.text
-        items = await asyncio.to_thread(extract, content)
-    except Exception:
-        log.exception("AI xatosi")
-        await reply(update, "⏳ AI hozir band. Birozdan keyin qayta yuboring.")
+        out = await asyncio.to_thread(_call_ai, ['{"items":[]} deb javob ber'], 1)
+        status = "✅ AI ishlayapti"
+    except AIAuthError:
+        status = "❌ GEMINI_API_KEY noto'g'ri yoki ruxsat yo'q"
+    except Exception as e:
+        status = "⚠️ AI hozir javob bermayapti: " + html.escape(str(e)[:120])
+    await reply(update, f"{status}\n\nModellar: <code>{html.escape(', '.join(models[:5]))}</code>")
+
+
+async def show_today(update, ctx):
+    uid = update.effective_user.id
+    today = now_local().replace(hour=0, minute=0, second=0)
+    rows = await asyncio.to_thread(fetch_range, uid, today, today + dt.timedelta(days=1))
+    await reply(update, build_report("📅 Bugun", rows))
+
+
+async def show_month(update, ctx):
+    uid = update.effective_user.id
+    n = now_local()
+    start = n.replace(day=1, hour=0, minute=0, second=0)
+    end = (start + dt.timedelta(days=32)).replace(day=1)
+    rows = await asyncio.to_thread(fetch_range, uid, start, end)
+    await reply(update, build_report("🗓 Shu oy", rows))
+
+
+MONTHS = ["", "Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun",
+          "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"]
+
+
+async def show_archive(update, ctx):
+    uid = update.effective_user.id
+    rows = await asyncio.to_thread(fetch_all, uid)
+    if not rows:
+        await reply(update, "<b>🗄 Arxiv</b>\n\nHozircha ma'lumot yo'q.")
         return
-
-    clean = []
-    for i in items:
-        if isinstance(i, dict) and isinstance(i.get("amount"), (int, float)) and i["amount"] > 0:
-            cat = i.get("category", "boshqa")
-            clean.append({
-                "amount": int(i["amount"]),
-                "note": (str(i.get("note", "")).strip()[:100] or "Xarajat"),
-                "category": cat if cat in CAT else "boshqa",
-            })
-    if not clean:
-        await reply(update, "🤔 Xarajatni tushunmadim.\nMasalan: <i>non 4000</i> yoki <i>taksi 15 ming</i>")
-        return
-
-    now = dt.datetime.now(TZ)
-    ids = []
-    with engine.begin() as c:
-        for i in clean:
-            r = c.execute(text(
-                "INSERT INTO expenses(user_id,amount,note,category,day,created_at) "
-                "VALUES(:u,:a,:n,:c,:d,:t) RETURNING id"),
-                {"u": uid, "a": i["amount"], "n": i["note"], "c": i["category"],
-                 "d": now.date().isoformat(), "t": now.isoformat()})
-            ids.append(r.scalar())
-    total = q("SELECT SUM(amount) AS s FROM expenses WHERE user_id=:u AND day=:d",
-              u=uid, d=now.date().isoformat())[0]["s"]
-
-    added = "\n".join(f"{CAT[i['category']]} {E(i['note'])} — <b>{fmt(i['amount'])}</b>" for i in clean)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("↩️ Bekor qilish", callback_data=f"undo:{min(ids)}-{max(ids)}"),
-        InlineKeyboardButton("📅 Bugungi ro'yxat", callback_data="today"),
-    ]])
-    await reply(update, f"✅ <b>Saqlandi</b>\n\n{added}\n\n💰 Bugun jami: <b>{fmt(total)}</b> so'm", kb)
+    agg = {}
+    for amount, created in rows:
+        d = to_dt(created)
+        key = (d.year, d.month)
+        agg[key] = agg.get(key, 0) + amount
+    lines = ["<b>🗄 Arxiv (oylar bo'yicha)</b>", ""]
+    for (y, m) in sorted(agg, reverse=True)[:12]:
+        lines.append(f"{MONTHS[m]} {y}: <b>{fmt(agg[(y, m)])}</b> so'm")
+    await reply(update, "\n".join(lines))
 
 
-async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query
-    await qy.answer()
-    uid = qy.from_user.id
-    d = qy.data or ""
-    if d == "today":
-        t, kb = day_view(uid, today())
-    elif d == "month":
-        t, kb = month_view(uid, today()[:7])
-    elif d == "arch":
-        t, kb = archive_view(uid)
-    elif d.startswith("m:"):
-        t, kb = month_view(uid, d[2:])
-    elif d.startswith("del:"):
-        rid = int(d[4:])
-        r = q("SELECT day FROM expenses WHERE id=:i AND user_id=:u", i=rid, u=uid)
-        day = r[0]["day"] if r else today()
-        q("DELETE FROM expenses WHERE id=:i AND user_id=:u", i=rid, u=uid)
-        t, kb = day_view(uid, day)
-    elif d.startswith("undo:"):
-        a, b = d[5:].split("-")
-        q("DELETE FROM expenses WHERE user_id=:u AND id BETWEEN :a AND :b", u=uid, a=int(a), b=int(b))
-        t, kb = "↩️ <b>Bekor qilindi.</b>", None
+async def do_undo(update, ctx):
+    row = await asyncio.to_thread(delete_last, update.effective_user.id)
+    if not row:
+        await reply(update, "O'chiriladigan xarajat yo'q.")
     else:
+        await reply(update, f"🗑 O'chirildi: {html.escape(row[3])} — <b>{fmt(row[1])}</b>")
+
+
+def confirm_text(items):
+    lines = ["✅ <b>Qo'shildi:</b>"]
+    for it in items:
+        lines.append(f"• {html.escape(it['note'])} — <b>{fmt(it['amount'])}</b> ({html.escape(it['category'])})")
+    if len(items) > 1:
+        lines.append(f"\nJami: <b>{fmt(sum(i['amount'] for i in items))}</b> so'm")
+    return "\n".join(lines)
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw = (update.effective_message.text or "").strip()
+    actions = {BTN_TODAY: show_today, BTN_MONTH: show_month, BTN_ARCHIVE: show_archive,
+               BTN_UNDO: do_undo, BTN_HELP: cmd_help}
+    if raw in actions:
+        await actions[raw](update, ctx)
+        return
+
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    items = parse_local(raw)  # 1) tez, AI siz
+    ai_down = False
+    if not items or any(i["category"] == "Boshqa" for i in items):
+        ai = await ai_from_text(raw)  # 2) kategoriya/murakkab matn uchun AI
+        if ai:
+            items = ai
+        elif ai is None:
+            ai_down = True
+
+    if not items:
+        if ai_down and client:
+            ok = schedule_retry(ctx.application, chat_id, uid, lambda: ai_from_text(raw))
+            if ok:
+                await reply(update, "⏳ AI hozir band. Xabaringiz saqlandi, tayyor bo'lgach o'zim yuboraman.")
+                return
+        await reply(update, "Tushunmadim 🤔\nMasalan: <code>non 5000</code> yoki <code>taksi 15 ming</code>")
         return
     try:
-        await qy.edit_message_text(t, parse_mode=HTML, reply_markup=kb)
-    except BadRequest:
-        pass
-
-
-# ---------- Avtomatik hisobotlar ----------
-def all_users():
-    return [r["user_id"] for r in q("SELECT user_id FROM users")]
-
-
-async def daily_job(ctx: ContextTypes.DEFAULT_TYPE):
-    for uid in all_users():
-        try:
-            t, _ = day_view(uid, today())
-            if "Hozircha xarajat yo'q" in t:
-                t = "🌙 Bugun xarajat kiritilmadi.\nUnutgan bo'lsangiz, hozir yozing 📝"
-            else:
-                t = "🌙 <b>Kun yakuni</b>\n\n" + t.split("\n\n<i>")[0]
-            await ctx.bot.send_message(uid, t, parse_mode=HTML)
-        except Exception:
-            log.exception("Kunlik hisobot yuborilmadi")
-
-
-async def monthly_job(ctx: ContextTypes.DEFAULT_TYPE):
-    now = dt.datetime.now(TZ)
-    if now.day != 1:
+        await asyncio.to_thread(add_expenses, uid, items)
+    except Exception as e:
+        log.error("Bazaga yozishda xato: %s", e)
+        await reply(update, "Saqlashda muammo bo'ldi, bir daqiqadan keyin qayta yuboring.")
         return
-    prev = (now.replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m")
-    for uid in all_users():
+    await reply(update, confirm_text(items))
+
+
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    media = msg.voice or msg.audio
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    mime = getattr(media, "mime_type", None) or "audio/ogg"
+    try:
+        f = await media.get_file()
+        data = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        log.error("Ovoz yuklanmadi: %s", e)
+        await reply(update, "Ovozni yuklab bo'lmadi, qayta yuboring yoki matn yozing.")
+        return
+
+    items = await ai_from_voice(data, mime, rounds=2)
+    if items is None:
+        ok = client and schedule_retry(
+            ctx.application, chat_id, uid, lambda: ai_from_voice(data, mime, rounds=1), prefix="🎤 ")
+        if ok:
+            await reply(update, "⏳ AI hozir band. Ovozingiz saqlandi, o'zim qayta urinaman va natijani shu yerga yuboraman.")
+        else:
+            await reply(update, "🎤 Ovozni hozir eshita olmadim. Iltimos, matn bilan yozing: <code>non 5000</code>")
+        return
+    if not items:
+        await reply(update, "Ovozdan xarajat topilmadi. Aniqroq ayting: «non besh ming».")
+        return
+    try:
+        await asyncio.to_thread(add_expenses, uid, items)
+    except Exception as e:
+        log.error("Bazaga yozishda xato: %s", e)
+        await reply(update, "Saqlashda muammo bo'ldi, qayta yuboring.")
+        return
+    await reply(update, "🎤 " + confirm_text(items))
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    err = ctx.error
+    if isinstance(err, Conflict):
+        log.error("409 Conflict: bu bot boshqa joyda ham ishlayapti. "
+                  "Ortiqcha nusxani (boshqa servis/kompyuter) to'xtating.")
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning("Tarmoq xatosi: %s", err)
+        return
+    log.error("Kutilmagan xato", exc_info=err)
+    if isinstance(update, Update) and update.effective_message:
         try:
-            t, _ = month_view(uid, prev)
-            if "xarajat yo'q" not in t:
-                await ctx.bot.send_message(uid, "📬 <b>Oylik hisobot tayyor!</b>\n\n" + t, parse_mode=HTML)
+            await update.effective_message.reply_text(
+                "⚠️ Kutilmagan xato bo'ldi, qayta urinib ko'ring.", reply_markup=KEYBOARD)
         except Exception:
-            log.exception("Oylik hisobot yuborilmadi")
+            pass
 
 
-# ---------- Render uchun: web server + o'zini uyg'oq tutish ----------
+# ---------------- Server (Render uchun) ----------------
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -367,47 +655,49 @@ class Ping(BaseHTTPRequestHandler):
         pass
 
 
-def run_http():
-    HTTPServer(("0.0.0.0", int(os.getenv("PORT", "10000"))), Ping).serve_forever()
+def start_server():
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Ping)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("HTTP server %s portda", PORT)
 
 
 async def self_ping(ctx: ContextTypes.DEFAULT_TYPE):
-    url = os.getenv("RENDER_EXTERNAL_URL")
-    if not url:
+    if not SELF_URL:
         return
     try:
-        await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=15).read())
-    except Exception:
-        log.warning("self-ping muvaffaqiyatsiz")
+        await asyncio.to_thread(urllib.request.urlopen, SELF_URL, None, 15)
+    except Exception as e:
+        log.warning("self_ping: %s", e)
 
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("bugun", "Bugungi xarajatlar"),
-        BotCommand("oy", "Shu oy hisoboti"),
-        BotCommand("arxiv", "Oylar arxivi"),
-        BotCommand("ochir", "Oxirgisini o'chirish"),
-        BotCommand("yordam", "Yordam"),
+        BotCommand("start", "Boshlash"),
+        BotCommand("help", "Yordam"),
+        BotCommand("ai", "AI holatini tekshirish"),
     ])
+    if client:
+        await asyncio.to_thread(get_models, True)
 
 
 def main():
     init_db()
-    threading.Thread(target=run_http, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    start_server()
+    app = (
+        Application.builder().token(BOT_TOKEN)
+        .concurrent_updates(True)          # bitta sekin so'rov boshqalarni to'xtatmaydi
+        .get_updates_read_timeout(30)
+        .post_init(post_init).build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("yordam", cmd_help))
-    app.add_handler(CommandHandler("bugun", cmd_today))
-    app.add_handler(CommandHandler("oy", cmd_month))
-    app.add_handler(CommandHandler("arxiv", cmd_archive))
-    app.add_handler(CommandHandler("ochir", cmd_undo))
-    app.add_handler(CallbackQueryHandler(on_cb))
-    app.add_handler(MessageHandler(filters.VOICE | (filters.TEXT & ~filters.COMMAND), handle))
-    jq = app.job_queue
-    jq.run_daily(daily_job, time=dt.time(22, 0, tzinfo=TZ))
-    jq.run_daily(monthly_job, time=dt.time(9, 0, tzinfo=TZ))
-    jq.run_repeating(self_ping, interval=600, first=60)
-    app.run_polling()
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ai", cmd_ai))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    if app.job_queue:
+        app.job_queue.run_repeating(self_ping, interval=480, first=60)
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
